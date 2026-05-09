@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>InkeepX — No Connection</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #ffffff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    overflow: hidden;
+    user-select: none;
+    -webkit-app-region: drag;
+  }
+
+  .card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    -webkit-app-region: no-drag;
+  }
+
+  /* ── Logo wordmark ── */
+  .logo {
+    font-size: 28px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: #111111;
+    margin-bottom: 48px;
+  }
+  .logo span { color: #E8000D; }
+
+  /* ── Wi-Fi off icon (pure CSS) ── */
+  .wifi-wrap {
+    position: relative;
+    width: 72px;
+    height: 72px;
+    margin-bottom: 32px;
+  }
+  .wifi-wrap svg {
+    width: 72px;
+    height: 72px;
+    opacity: 0.18;
+  }
+  .slash {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 2px;
+    height: 80px;
+    background: #E8000D;
+    border-radius: 2px;
+    transform: translate(-50%, -50%) rotate(45deg);
+    opacity: 0.85;
+  }
+
+  /* ── Text ── */
+  .title {
+    font-size: 18px;
+    font-weight: 600;
+    color: #111111;
+    margin-bottom: 10px;
+    text-align: center;
+  }
+  .sub {
+    font-size: 14px;
+    color: #888888;
+    text-align: center;
+    line-height: 1.6;
+    max-width: 280px;
+    margin-bottom: 40px;
+  }
+
+  /* ── Retry button ── */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 11px 28px;
+    background: #E8000D;
+    color: #ffffff;
+    font-size: 14px;
+    font-weight: 600;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s;
+    outline: none;
+  }
+  .btn:hover  { background: #c4000b; }
+  .btn:active { transform: scale(0.97); }
+
+  /* ── Retry spin feedback ── */
+  .btn svg { transition: transform 0.4s; }
+  .btn.spinning svg { animation: spin 0.7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Bottom hint ── */
+  .hint {
+    position: fixed;
+    bottom: 24px;
+    left: 0; right: 0;
+    text-align: center;
+    font-size: 12px;
+    color: #cccccc;
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="logo">Inkeep<span>X</span></div>
+
+  <div class="wifi-wrap">
+    <!-- Wi-Fi arc SVG -->
+    <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M5 12.55a11 11 0 0 1 14.08 0" stroke="#111" stroke-width="1.8" stroke-linecap="round"/>
+      <path d="M1.42 9A16 16 0 0 1 22.58 9" stroke="#111" stroke-width="1.8" stroke-linecap="round"/>
+      <path d="M8.53 16.11a6 6 0 0 1 6.95 0"  stroke="#111" stroke-width="1.8" stroke-linecap="round"/>
+      <circle cx="12" cy="20" r="1" fill="#111"/>
+    </svg>
+    <div class="slash"></div>
+  </div>
+
+  <div class="title">No Internet Connection</div>
+  <div class="sub">Please check your network connection and try again.</div>
+
+  <button class="btn" id="retryBtn" onclick="retry()">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="1 4 1 10 7 10"/>
+      <path d="M3.51 15a9 9 0 1 0 .49-4.5"/>
+    </svg>
+    Try Again
+  </button>
+</div>
+
+<div class="hint">inkeepx.com</div>
+
+<script>
+  function retry() {
+    const btn = document.getElementById('retryBtn');
+    btn.classList.add('spinning');
+    btn.disabled = true;
+    // Tell main process to retry
+    if (window.__electronBridge) {
+      window.__electronBridge.retry();
+    }
+    // Re-enable after 3s in case it stays on this page
+    setTimeout(() => {
+      btn.classList.remove('spinning');
+      btn.disabled = false;
+    }, 3000);
+  }
+</script>
+</body>
+</html>

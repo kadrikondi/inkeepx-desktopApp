@@ -1,0 +1,48 @@
+{
+  "name": "inkeepx-desktop",
+  "version": "1.0.0",
+  "description": "InkeepX Desktop — WebView wrapper for inkeepx.com",
+  "main": "src/main.js",
+  "author": "InkeepX",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --win --x64",
+    "build:win32": "electron-builder --win --ia32"
+  },
+  "dependencies": {
+    "electron-store": "^8.2.0"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.inkeepx.desktop",
+    "productName": "InkeepX",
+    "copyright": "Copyright © 2025 InkeepX",
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "assets/icon.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "InkeepX"
+    },
+    "files": [
+      "src/**/*",
+      "assets/**/*",
+      "node_modules/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "buildResources": "assets",
+      "output": "dist"
+    }
+  }
+}

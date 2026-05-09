@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>InkeepX</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #ffffff;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    overflow: hidden;
+    user-select: none;
+    -webkit-app-region: drag;
+  }
+
+  /* ── Logo ── */
+  .logo {
+    font-size: 32px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: #111111;
+    margin-bottom: 40px;
+    opacity: 0;
+    transform: translateY(6px);
+    animation: fadeUp 0.5s ease 0.1s forwards;
+  }
+  .logo span { color: #E8000D; }
+
+  /* ── Spinner ── */
+  .spinner-wrap {
+    opacity: 0;
+    animation: fadeUp 0.4s ease 0.3s forwards;
+  }
+  .spinner {
+    width: 32px;
+    height: 32px;
+    border: 3px solid #f0f0f0;
+    border-top-color: #E8000D;
+    border-radius: 50%;
+    animation: spin 0.75s linear infinite;
+  }
+
+  @keyframes spin   { to { transform: rotate(360deg); } }
+  @keyframes fadeUp {
+    to { opacity: 1; transform: translateY(0); }
+  }
+</style>
+</head>
+<body>
+  <div class="logo">Inkeep<span>X</span></div>
+  <div class="spinner-wrap">
+    <div class="spinner"></div>
+  </div>
+</body>
+</html>
