@@ -25,13 +25,23 @@ const {
   Menu,
   net,
   nativeTheme,
+  screen,
+  clipboard,
 } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const path  = require('path');
 const fs    = require('fs');
 const os    = require('os');
 const https = require('https');
 const http  = require('http');
 const url   = require('url');
+
+// Bigger disk cache (500 MB) so the site's static assets survive between
+// launches — must be set before the app is ready.
+app.commandLine.appendSwitch('disk-cache-size', String(500 * 1024 * 1024));
+
+// Windows needs an explicit AppUserModelID or web notifications won't display.
+app.setAppUserModelId('com.inkeepx.desktop');
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const LOGIN_URL    = 'https://www.inkeepx.com/login';
@@ -44,6 +54,9 @@ const OFFLINE_PAGE = url.pathToFileURL(path.join(__dirname, 'offline.html')).toS
 // ── State ────────────────────────────────────────────────────────────────────
 let isOffline   = false;   // true while the offline page is shown
 let pendingUrl  = null;    // the real URL we want to load after the splash
+let dataSaver   = false;   // block images/media/trackers when true (restored from prefs)
+let mainSes     = null;    // the persistent session, kept for probes/warm-up
+let isQuitting  = false;   // don't auto-recover a renderer that died because we're exiting
 
 // ── Tiny JSON store (avoids adding electron-store runtime dep for packaging) ─
 function readPrefs() {
@@ -57,26 +70,184 @@ function writePrefs(data) {
 // ── Global refs ──────────────────────────────────────────────────────────────
 let mainWin = null;
 
-// ── App ready ────────────────────────────────────────────────────────────────
-app.whenReady().then(createWindow);
+// ── URL helper — is this really our site? ────────────────────────────────────
+// Hostname check, not substring: "https://evil.com/inkeepx.com" must NOT pass.
+function isInkeepxUrl(u) {
+  try {
+    const { protocol, hostname } = new URL(u);
+    if (protocol !== 'https:' && protocol !== 'http:') return false;
+    return hostname === 'inkeepx.com' || hostname.endsWith('.inkeepx.com');
+  } catch { return false; }
+}
 
+// ── Window state persistence (size / position / maximized) ──────────────────
+function getSavedWindowState() {
+  const s = readPrefs().windowState;
+  if (!s || typeof s.width !== 'number' || typeof s.height !== 'number') return null;
+  // Drop the saved position if it's no longer on a connected display
+  // (e.g. an unplugged external monitor).
+  if (typeof s.x === 'number' && typeof s.y === 'number') {
+    const onScreen = screen.getAllDisplays().some((d) => {
+      const a = d.workArea;
+      return s.x >= a.x - s.width + 100 && s.x <= a.x + a.width - 100 &&
+             s.y >= a.y - 20 && s.y <= a.y + a.height - 100;
+    });
+    if (!onScreen) { delete s.x; delete s.y; }
+  }
+  return s;
+}
+
+function saveWindowState() {
+  if (!mainWin || mainWin.isDestroyed()) return;
+  try {
+    const bounds = mainWin.getNormalBounds();
+    writePrefs({
+      ...readPrefs(),
+      windowState: { ...bounds, maximized: mainWin.isMaximized() },
+    });
+  } catch { /* window already gone */ }
+}
+
+// ── Slow-network helpers ─────────────────────────────────────────────────────
+const STATIC_ASSET_RE = /\.(m?js|css|woff2?|ttf|otf|png|jpe?g|gif|webp|avif|svg|ico)([?#].*)?$/i;
+const TRACKER_RE = /(google-analytics\.com|googletagmanager\.com|doubleclick\.net|connect\.facebook\.net|hotjar\.com|segment\.(io|com)|mixpanel\.com|clarity\.ms)/i;
+
+// Perform DNS + TCP + TLS handshakes while the splash screen is showing so the
+// real navigation reuses the warm connection (saves 1–3 s on high-latency links).
+function warmUpConnection() {
+  if (!mainSes) return;
+  try {
+    const req = net.request({ method: 'HEAD', url: APP_URL, session: mainSes });
+    req.on('response', (res) => { res.on('data', () => {}); res.on('error', () => {}); });
+    req.on('error', () => {});
+    req.end();
+  } catch { /* best-effort only */ }
+}
+
+function setupNetworkOptimizations(ses) {
+  // Serve static assets from the disk cache for a week even if the server
+  // sends short-lived cache headers — repeat launches barely touch the network.
+  ses.webRequest.onHeadersReceived((details, callback) => {
+    if (details.method !== 'GET' || details.statusCode !== 200 ||
+        !STATIC_ASSET_RE.test(details.url)) {
+      callback({});
+      return;
+    }
+    const headers = {};
+    for (const [k, v] of Object.entries(details.responseHeaders || {})) {
+      const lk = k.toLowerCase();
+      if (lk !== 'cache-control' && lk !== 'pragma' && lk !== 'expires') headers[k] = v;
+    }
+    headers['Cache-Control'] = ['public, max-age=604800, stale-while-revalidate=86400'];
+    callback({ responseHeaders: headers });
+  });
+
+  // Data Saver: drop images, media and tracker requests when enabled.
+  ses.webRequest.onBeforeRequest((details, callback) => {
+    if (dataSaver && !details.url.startsWith('file:')) {
+      if (TRACKER_RE.test(details.url) ||
+          details.resourceType === 'image' || details.resourceType === 'media') {
+        callback({ cancel: true });
+        return;
+      }
+    }
+    callback({});
+  });
+}
+
+// ── Auto-reconnect probe (runs while the offline page is shown) ──────────────
+let reconnectTimer  = null;
+let probeInFlight   = false;
+
+function startReconnectProbe() {
+  if (reconnectTimer) return;
+  reconnectTimer = setInterval(() => {
+    if (!isOffline || !mainWin || !mainSes) { stopReconnectProbe(); return; }
+    if (probeInFlight) return;
+    probeInFlight = true;
+    const req  = net.request({ method: 'HEAD', url: APP_URL, session: mainSes });
+    const kill = setTimeout(() => { try { req.abort(); } catch {} }, 4000);
+    req.on('response', (res) => {
+      clearTimeout(kill);
+      probeInFlight = false;
+      res.on('data', () => {}); res.on('error', () => {});
+      // Server reachable again — reload automatically
+      if (isOffline) retryLoad();
+    });
+    req.on('error', () => { clearTimeout(kill); probeInFlight = false; });
+    req.on('abort', () => { clearTimeout(kill); probeInFlight = false; });
+    req.end();
+  }, 5000);
+}
+
+function stopReconnectProbe() {
+  clearInterval(reconnectTimer);
+  reconnectTimer = null;
+  probeInFlight  = false;
+}
+
+// Shared by the offline page's Retry button and the auto-reconnect probe.
+function retryLoad() {
+  if (!mainWin) return;
+  isOffline = false;
+  stopReconnectProbe();
+  warmUpConnection();
+  const prefs = readPrefs();
+  pendingUrl  = prefs.lastUrl || LOGIN_URL;
+  mainWin.loadURL(LOADING_PAGE);
+}
+
+// ── Single instance — a second launch just focuses the existing window ──────
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (!mainWin) return;
+    if (mainWin.isMinimized()) mainWin.restore();
+    mainWin.show();
+    mainWin.focus();
+  });
+}
+
+// ── App ready ────────────────────────────────────────────────────────────────
+app.whenReady().then(() => { if (gotSingleInstanceLock) createWindow(); });
+
+app.on('before-quit', () => { isQuitting = true; });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
 app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 
 // ── createWindow ─────────────────────────────────────────────────────────────
 function createWindow() {
   const ses = session.fromPartition(`persist:${SESS_PART}`);
+  mainSes   = ses;
+  dataSaver = readPrefs().dataSaver === true;
+
+  // Warm the connection immediately — handshakes happen behind the splash.
+  warmUpConnection();
+  setupNetworkOptimizations(ses);
 
   // Cookies persist automatically with a named partition.
-  // Allow third-party cookies (same as Android's setAcceptThirdPartyCookies).
-  ses.setPermissionRequestHandler((webContents, permission, callback) => {
-    // Allow all permissions the site may request (camera, microphone, etc.)
-    callback(true);
+  // Grant only the permissions the site actually needs, and only to inkeepx.com.
+  const ALLOWED_PERMISSIONS = new Set([
+    'media',                     // camera + microphone
+    'notifications',
+    'fullscreen',
+    'clipboard-read',
+    'clipboard-sanitized-write',
+  ]);
+  ses.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const requestingUrl = (details && details.requestingUrl) || webContents.getURL();
+    callback(isInkeepxUrl(requestingUrl) && ALLOWED_PERMISSIONS.has(permission));
   });
 
+  const winState = getSavedWindowState();
+
   mainWin = new BrowserWindow({
-    width:  1280,
-    height: 820,
+    width:  (winState && winState.width)  || 1280,
+    height: (winState && winState.height) || 820,
+    x: winState ? winState.x : undefined,
+    y: winState ? winState.y : undefined,
     minWidth:  800,
     minHeight: 600,
     title: 'InkeepX',
@@ -96,6 +267,11 @@ function createWindow() {
       partition: `persist:${SESS_PART}`,
     },
   });
+
+  if (winState && winState.maximized) mainWin.maximize();
+
+  // Remember size/position for next launch
+  mainWin.on('close', saveWindowState);
 
   // ── Application menu (minimal — just what's useful) ───────────────────────
   buildAppMenu();
@@ -145,6 +321,7 @@ function createWindow() {
 
     // Real page loaded — persist session state
     isOffline = false;
+    stopReconnectProbe();
     const onLogin = currentUrl.includes('/login');
     const prefs   = readPrefs();
     writePrefs({
@@ -170,11 +347,12 @@ function createWindow() {
 
     isOffline = true;
     wc.loadURL(OFFLINE_PAGE);
+    startReconnectProbe();
   });
 
   // Open external links in the system browser
   wc.setWindowOpenHandler(({ url: openUrl }) => {
-    if (!openUrl.includes('inkeepx.com')) {
+    if (!isInkeepxUrl(openUrl)) {
       shell.openExternal(openUrl);
       return { action: 'deny' };
     }
@@ -183,12 +361,74 @@ function createWindow() {
 
   wc.on('will-navigate', (event, navUrl) => {
     // Allow local pages (loading / offline)
-    if (navUrl.startsWith('file://')) return;
+    if (navUrl.startsWith('file://') || navUrl.startsWith('about:')) return;
     // Keep navigation inside inkeepx.com; send everything else to the browser
-    if (!navUrl.includes('inkeepx.com') && !navUrl.startsWith('about:')) {
+    if (!isInkeepxUrl(navUrl)) {
       event.preventDefault();
       shell.openExternal(navUrl);
     }
+  });
+
+  // ── Crash recovery — reload instead of leaving a dead white window ────────
+  wc.on('render-process-gone', (e, details) => {
+    if (isQuitting || details.reason === 'clean-exit') return;
+    console.error('Renderer crashed:', details.reason);
+    retryLoad();
+  });
+
+  wc.on('unresponsive', () => {
+    console.warn('Page unresponsive');
+  });
+
+  // Forward find-in-page results to the find bar in the renderer
+  wc.on('found-in-page', (e, result) => {
+    wc.send('find-result', {
+      activeMatchOrdinal: result.activeMatchOrdinal,
+      matches: result.matches,
+    });
+  });
+
+  // ── Right-click context menu ───────────────────────────────────────────────
+  wc.on('context-menu', (event, params) => {
+    const template = [];
+
+    if (params.linkURL) {
+      template.push(
+        { label: 'Open Link in Browser', click: () => shell.openExternal(params.linkURL) },
+        { label: 'Copy Link Address',    click: () => clipboard.writeText(params.linkURL) },
+        { type: 'separator' },
+      );
+    }
+
+    if (params.isEditable) {
+      template.push(
+        { role: 'cut',       enabled: params.editFlags.canCut },
+        { role: 'copy',      enabled: params.editFlags.canCopy },
+        { role: 'paste',     enabled: params.editFlags.canPaste },
+        { role: 'selectAll', enabled: params.editFlags.canSelectAll },
+        { type: 'separator' },
+      );
+    } else if (params.selectionText) {
+      template.push(
+        { role: 'copy' },
+        { type: 'separator' },
+      );
+    }
+
+    template.push(
+      { label: 'Back',    enabled: wc.canGoBack(),    click: () => wc.goBack() },
+      { label: 'Forward', enabled: wc.canGoForward(), click: () => wc.goForward() },
+      { label: 'Reload',  click: () => wc.reload() },
+    );
+
+    if (process.env.NODE_ENV === 'development') {
+      template.push(
+        { type: 'separator' },
+        { label: 'Inspect Element', click: () => wc.inspectElement(params.x, params.y) },
+      );
+    }
+
+    Menu.buildFromTemplate(template).popup({ window: mainWin });
   });
 
   // ── IPC handlers ──────────────────────────────────────────────────────────
@@ -202,6 +442,43 @@ function createWindow() {
   }
   // Show branded loading splash immediately (no blank window)
   mainWin.loadURL(LOADING_PAGE);
+
+  // ── Auto-update (GitHub Releases) ─────────────────────────────────────────
+  setupAutoUpdate();
+}
+
+// ── Auto-update ──────────────────────────────────────────────────────────────
+function setupAutoUpdate() {
+  // Only packaged builds can update; skip in development
+  if (!app.isPackaged) return;
+
+  autoUpdater.autoDownload          = true;
+  autoUpdater.autoInstallOnAppQuit  = true;   // installs silently on quit
+
+  autoUpdater.on('update-downloaded', (info) => {
+    dialog.showMessageBox(mainWin, {
+      type:    'info',
+      title:   'Update Ready',
+      message: `InkeepX ${info.version} has been downloaded.`,
+      detail:  'Restart the app to apply the update.',
+      buttons: ['Restart Now', 'Later'],
+      defaultId: 0,
+    }).then(({ response }) => {
+      if (response === 0) {
+        isQuitting = true;
+        autoUpdater.quitAndInstall();
+      }
+    });
+  });
+
+  autoUpdater.on('error', (err) => {
+    // Never bother the user about update failures — just log
+    console.error('Auto-update error:', err?.message || err);
+  });
+
+  autoUpdater.checkForUpdates().catch(() => {});
+  // Re-check every 4 hours while the app stays open
+  setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 4 * 60 * 60 * 1000);
 }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
@@ -213,13 +490,7 @@ function setupIpc(ses) {
   ipcMain.on('nav-home',    () => mainWin?.loadURL(LOGIN_URL));
 
   // Retry when offline — load the splash then the real URL
-  ipcMain.on('retry', () => {
-    if (!mainWin) return;
-    isOffline  = false;
-    const prefs = readPrefs();
-    pendingUrl  = prefs.lastUrl || LOGIN_URL;
-    mainWin.loadURL(LOADING_PAGE);
-  });
+  ipcMain.on('retry', retryLoad);
 
   // File upload — preload asks us for a file path
   ipcMain.handle('open-file-dialog', async (event, opts = {}) => {
@@ -247,6 +518,14 @@ function setupIpc(ses) {
     });
   });
 
+  // Find in page (Ctrl+F overlay in preload)
+  ipcMain.on('find-in-page', (e, text, opts) => {
+    if (text) mainWin?.webContents.findInPage(text, opts || {});
+  });
+  ipcMain.on('find-stop', () => {
+    mainWin?.webContents.stopFindInPage('clearSelection');
+  });
+
   // Navigation state query (for enabling/disabling buttons)
   ipcMain.handle('nav-state', () => {
     if (!mainWin) return { canGoBack: false, canGoForward: false };
@@ -259,25 +538,26 @@ function setupIpc(ses) {
 
 // ── Download: will-download (handles normal file downloads) ──────────────────
 function handleWillDownload(event, item) {
-  // Let Electron show the native save-as dialog
   const defaultPath = path.join(
     app.getPath('downloads'),
     item.getFilename()
   );
 
-  // Show native save dialog
-  const savePath = dialog.showSaveDialogSync(mainWin, {
+  // Pause the download and show the save dialog asynchronously so the
+  // main process (and the whole UI) never freezes while it's open.
+  item.pause();
+  dialog.showSaveDialog(mainWin, {
     title:       'Save File',
     defaultPath,
     buttonLabel: 'Save',
-  });
-
-  if (!savePath) {
-    item.cancel();
-    return;
-  }
-
-  item.setSavePath(savePath);
+  }).then(({ canceled, filePath }) => {
+    if (canceled || !filePath) {
+      item.cancel();
+      return;
+    }
+    item.setSavePath(filePath);
+    item.resume();
+  }).catch(() => item.cancel());
 
   item.on('updated', (e, state) => {
     if (state === 'progressing') {
@@ -337,13 +617,13 @@ async function saveBase64File(base64, mimeType, suggestedName) {
   const ext  = mimeMap[mimeType] || mimeType.split('/')[1] || 'bin';
   const name = suggestedName || `inkeepx_export_${Date.now()}.${ext}`;
 
-  const savePath = dialog.showSaveDialogSync(mainWin, {
+  const { canceled, filePath: savePath } = await dialog.showSaveDialog(mainWin, {
     title:       'Save File',
     defaultPath: path.join(app.getPath('downloads'), name),
     buttonLabel: 'Save',
   });
 
-  if (!savePath) return;  // user cancelled
+  if (canceled || !savePath) return;  // user cancelled
 
   const data = Buffer.from(base64, 'base64');
   fs.writeFileSync(savePath, data);
@@ -493,12 +773,29 @@ function buildAppMenu() {
         { type: 'separator' },
         { label: 'Print',  accelerator: 'CmdOrCtrl+P',  click: () => mainWin?.webContents.print({ printBackground: true }) },
         { type: 'separator' },
+        {
+          label: 'Data Saver (block images & media)',
+          type: 'checkbox',
+          checked: dataSaver,
+          click: (item) => {
+            dataSaver = item.checked;
+            writePrefs({ ...readPrefs(), dataSaver });
+            mainWin?.webContents.reload();
+          },
+        },
+        { type: 'separator' },
         { role: 'quit' },
       ],
     },
     {
       label: 'View',
       submenu: [
+        {
+          label: 'Find on Page…',
+          accelerator: 'CmdOrCtrl+F',
+          click: () => mainWin?.webContents.send('find-open'),
+        },
+        { type: 'separator' },
         { role: 'resetZoom' },
         { role: 'zoomIn',  accelerator: 'CmdOrCtrl+=' },
         { role: 'zoomOut', accelerator: 'CmdOrCtrl+-' },

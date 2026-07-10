@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -e \"new Function\\(require\\('fs'\\).readFileSync\\('src/main.js','utf8'\\)\\); console.log\\('syntax OK'\\)\")",
+      "Bash(timeout 25 npx electron .)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(npm install *)"
+    ]
+  }
+}

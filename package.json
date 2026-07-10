@@ -1,6 +1,6 @@
 {
   "name": "inkeepx-desktop",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "InkeepX Desktop — WebView wrapper for inkeepx.com",
   "main": "src/main.js",
   "author": "InkeepX",
@@ -8,10 +8,12 @@
   "scripts": {
     "start": "electron .",
     "build:win": "electron-builder --win --x64",
-    "build:win32": "electron-builder --win --ia32"
+    "build:win32": "electron-builder --win --ia32",
+    "release": "electron-builder --win --x64 --publish always"
   },
   "dependencies": {
-    "electron-store": "^8.2.0"
+    "electron-store": "^8.2.0",
+    "electron-updater": "^6.8.9"
   },
   "devDependencies": {
     "electron": "^30.0.0",
@@ -21,9 +23,21 @@
     "appId": "com.inkeepx.desktop",
     "productName": "InkeepX",
     "copyright": "Copyright © 2025 InkeepX",
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "kadrikondi",
+        "repo": "inkeepx-desktopApp"
+      }
+    ],
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "assets/icon.png"
     },
