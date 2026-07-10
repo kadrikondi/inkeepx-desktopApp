@@ -372,6 +372,20 @@ function createWindow() {
     }
   });
 
+  // ── Session expiry / HTTP errors ───────────────────────────────────────────
+  // When the session expires the server answers with a 4xx page that can
+  // render as a dark/blank screen. Send the user back to the login page.
+  wc.on('did-navigate', (e, navUrl, httpResponseCode) => {
+    if (navUrl.startsWith('file://')) return;
+    if (navUrl.includes('/login')) return;   // never loop on the login page itself
+    if (httpResponseCode >= 400) {
+      console.warn(`HTTP ${httpResponseCode} on ${navUrl} — returning to login`);
+      writePrefs({ ...readPrefs(), loggedIn: false, lastUrl: LOGIN_URL });
+      pendingUrl = LOGIN_URL;
+      mainWin.loadURL(LOADING_PAGE);
+    }
+  });
+
   // ── Crash recovery — reload instead of leaving a dead white window ────────
   wc.on('render-process-gone', (e, details) => {
     if (isQuitting || details.reason === 'clean-exit') return;

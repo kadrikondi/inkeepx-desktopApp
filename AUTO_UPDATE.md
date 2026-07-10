@@ -12,10 +12,12 @@ Users getting updates only happens once you **publish a release**. Pushing
 code to GitHub does nothing for installed apps. Next time you have a new
 version to ship, the flow is:
 
-```powershell
-$env:GH_TOKEN = "ghp_your_token"     # token with repo scope, only on your machine
-npm version patch                     # 1.0.1 -> 1.0.2
-npm run release                       # builds + uploads installer to GitHub Releases
+```bash
+git add -A && git commit -m "your changes"   # npm version needs a clean tree
+export GH_TOKEN="ghp_your_token_here"        # PowerShell: $env:GH_TOKEN = "..."
+npm version patch          # 1.0.1 -> 1.0.2 (also makes a commit + git tag)
+npm run release            # builds the installer and uploads it to GitHub Releases
+git push --follow-tags     # push the version-bump commit and tag
 ```
 
 That's it — installed apps pick it up on their next launch or 4-hour check.

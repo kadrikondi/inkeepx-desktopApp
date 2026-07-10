@@ -25,12 +25,32 @@
     font-weight: 700;
     letter-spacing: -0.5px;
     color: #111111;
-    margin-bottom: 40px;
+    margin-bottom: 18px;
     opacity: 0;
     transform: translateY(6px);
     animation: fadeUp 0.5s ease 0.1s forwards;
   }
   .logo span { color: #E8000D; }
+
+  /* ── Greeting ── */
+  .greet {
+    font-size: 17px;
+    font-weight: 600;
+    color: #333333;
+    margin-bottom: 6px;
+    opacity: 0;
+    transform: translateY(6px);
+    animation: fadeUp 0.5s ease 0.25s forwards;
+  }
+  .greet span { color: #E8000D; }
+  .tagline {
+    font-size: 13px;
+    color: #999999;
+    margin-bottom: 36px;
+    opacity: 0;
+    transform: translateY(6px);
+    animation: fadeUp 0.5s ease 0.4s forwards;
+  }
 
   /* ── Spinner ── */
   .spinner-wrap {
@@ -54,8 +74,22 @@
 </head>
 <body>
   <div class="logo">Inkeep<span>X</span></div>
+  <div class="greet" id="greet"></div>
+  <div class="tagline">Modern Inventory &amp; POS Solutions</div>
   <div class="spinner-wrap">
     <div class="spinner"></div>
   </div>
+
+<script>
+  (function() {
+    var h = new Date().getHours();
+    var g = (h >= 5 && h < 12) ? 'Good Morning'
+          : (h >= 12 && h < 17) ? 'Good Afternoon'
+          : (h >= 17 && h < 21) ? 'Good Evening'
+          : 'Good Night';
+    document.getElementById('greet').innerHTML =
+      g + ', welcome to Inkeep<span>X</span>';
+  })();
+</script>
 </body>
 </html>

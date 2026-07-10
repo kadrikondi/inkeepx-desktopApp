@@ -27,7 +27,8 @@
       {
         "provider": "github",
         "owner": "kadrikondi",
-        "repo": "inkeepx-desktopApp"
+        "repo": "inkeepx-desktopApp",
+        "releaseType": "release"
       }
     ],
     "win": {

@@ -68,15 +68,42 @@ The app auto-updates from **GitHub Releases** (`kadrikondi/inkeepx-desktopApp`).
 Users getting updates only happens once you **publish a release** — pushing code
 alone does nothing for installed apps. When you have a new version to ship:
 
-```powershell
-$env:GH_TOKEN = "ghp_your_token"     # token with repo scope, only on your machine
-npm version patch                     # 1.0.1 -> 1.0.2 (never reuse or lower a version)
-npm run release                       # builds + uploads installer to GitHub Releases
+**Step 1 — commit all your changes first** (`npm version` refuses to run on a
+dirty working tree):
+
+```bash
+git add -A
+git commit -m "describe your changes"
 ```
 
+**Step 2 — publish the release.**
+
+In **Git Bash** (no spaces around `=`):
+
+```bash
+export GH_TOKEN="ghp_your_token_here"   # token with repo scope, only on your machine
+npm version patch          # 1.0.1 -> 1.0.2 (also makes a commit + git tag)
+npm run release            # builds the installer and uploads it to GitHub Releases
+git push --follow-tags     # push the version-bump commit and tag
+```
+
+Or in **PowerShell**:
+
+```powershell
+$env:GH_TOKEN = "ghp_your_token_here"
+npm version patch          # 1.0.1 -> 1.0.2 (also makes a commit + git tag)
+npm run release            # builds the installer and uploads it to GitHub Releases
+git push --follow-tags     # push the version-bump commit and tag
+```
+
+Then verify the new version (with `InkeepX Setup x.x.x.exe` + `latest.yml`)
+appears at <https://github.com/kadrikondi/inkeepx-desktopApp/releases>.
+
 Installed apps check on every launch (and every 4 hours), download the update in
-the background, and ask the user to restart. The repo must be **public** for
-users to download updates. Full guide, caveats, and alternatives: [AUTO_UPDATE.md](AUTO_UPDATE.md).
+the background, and ask the user to restart — or check manually via the
+**Update → Check for Updates…** menu. The repo must be **public** for users to
+download updates. Never reuse or lower a version number. Full guide, caveats,
+and alternatives: [AUTO_UPDATE.md](AUTO_UPDATE.md).
 
 ---
 
