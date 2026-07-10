@@ -70,6 +70,19 @@
   @keyframes fadeUp {
     to { opacity: 1; transform: translateY(0); }
   }
+
+  /* ── Slow connection hint (appears after 12s) ── */
+  .slow-hint {
+    margin-top: 28px;
+    font-size: 13px;
+    color: #aaaaaa;
+    text-align: center;
+    max-width: 300px;
+    line-height: 1.5;
+    opacity: 0;
+    transition: opacity 0.6s ease;
+  }
+  .slow-hint.show { opacity: 1; }
 </style>
 </head>
 <body>
@@ -79,8 +92,13 @@
   <div class="spinner-wrap">
     <div class="spinner"></div>
   </div>
+  <div class="slow-hint" id="slowHint">Taking longer than usual — your connection may be slow&hellip;</div>
 
 <script>
+  setTimeout(function() {
+    document.getElementById('slowHint').classList.add('show');
+  }, 12000);
+
   (function() {
     var h = new Date().getHours();
     var g = (h >= 5 && h < 12) ? 'Good Morning'

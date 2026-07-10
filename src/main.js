@@ -50,6 +50,7 @@ const PREFS_FILE   = path.join(app.getPath('userData'), 'session.json');
 const SESS_PART    = 'inkeepx-persist';         // named session keeps cookies
 const LOADING_PAGE = url.pathToFileURL(path.join(__dirname, 'loading.html')).toString();
 const OFFLINE_PAGE = url.pathToFileURL(path.join(__dirname, 'offline.html')).toString();
+const ERROR_PAGE   = url.pathToFileURL(path.join(__dirname, 'error.html')).toString();
 
 // ── State ────────────────────────────────────────────────────────────────────
 let isOffline   = false;   // true while the offline page is shown
@@ -57,6 +58,9 @@ let pendingUrl  = null;    // the real URL we want to load after the splash
 let dataSaver   = false;   // block images/media/trackers when true (restored from prefs)
 let mainSes     = null;    // the persistent session, kept for probes/warm-up
 let isQuitting  = false;   // don't auto-recover a renderer that died because we're exiting
+let retryUrl    = null;    // exact URL to retry (set when the error page is shown)
+let sessionExpiredNotice = false;  // show a toast on the login page after an auth error
+let availablePrinters    = [];     // cached printer list for the Printer menu
 
 // ── Tiny JSON store (avoids adding electron-store runtime dep for packaging) ─
 function readPrefs() {
@@ -186,14 +190,15 @@ function stopReconnectProbe() {
   probeInFlight  = false;
 }
 
-// Shared by the offline page's Retry button and the auto-reconnect probe.
+// Shared by the offline/error pages' Retry buttons and the auto-reconnect probe.
 function retryLoad() {
   if (!mainWin) return;
   isOffline = false;
   stopReconnectProbe();
   warmUpConnection();
   const prefs = readPrefs();
-  pendingUrl  = prefs.lastUrl || LOGIN_URL;
+  pendingUrl  = retryUrl || prefs.lastUrl || LOGIN_URL;
+  retryUrl    = null;
   mainWin.loadURL(LOADING_PAGE);
 }
 
@@ -226,6 +231,9 @@ function createWindow() {
   // Warm the connection immediately — handshakes happen behind the splash.
   warmUpConnection();
   setupNetworkOptimizations(ses);
+
+  // Spellcheck in text fields (suggestions appear in the right-click menu)
+  try { ses.setSpellCheckerLanguages(['en-US']); } catch { /* unsupported language */ }
 
   // Cookies persist automatically with a named partition.
   // Grant only the permissions the site actually needs, and only to inkeepx.com.
@@ -263,6 +271,7 @@ function createWindow() {
       // Enable all features needed by the web app
       plugins: true,
       javascript: true,
+      spellcheck: true,
       // Allow localStorage / IndexedDB
       partition: `persist:${SESS_PART}`,
     },
@@ -275,6 +284,7 @@ function createWindow() {
 
   // ── Application menu (minimal — just what's useful) ───────────────────────
   buildAppMenu();
+  refreshPrinters();   // fills the Printer menu once the list is fetched
 
   // ── Download handler ──────────────────────────────────────────────────────
   ses.on('will-download', handleWillDownload);
@@ -316,8 +326,8 @@ function createWindow() {
       return;
     }
 
-    // If this is the offline page, nothing more to do
-    if (currentUrl.includes('offline.html')) return;
+    // If this is the offline or error page, nothing more to do
+    if (currentUrl.includes('offline.html') || currentUrl.includes('error.html')) return;
 
     // Real page loaded — persist session state
     isOffline = false;
@@ -336,6 +346,12 @@ function createWindow() {
 
     // Version tag at the bottom of the login screen
     if (onLogin) injectVersionTag(wc);
+
+    // Tell the user why they landed back on the login page
+    if (onLogin && sessionExpiredNotice) {
+      sessionExpiredNotice = false;
+      injectToast(wc, 'Your session expired — please sign in again.');
+    }
   });
 
   wc.on('did-fail-load', (e, code, desc, validatedUrl, isMainFrame) => {
@@ -373,16 +389,24 @@ function createWindow() {
   });
 
   // ── Session expiry / HTTP errors ───────────────────────────────────────────
-  // When the session expires the server answers with a 4xx page that can
-  // render as a dark/blank screen. Send the user back to the login page.
+  // The server can answer with an error page that renders dark/blank.
+  //   • Auth errors (session expired) → back to the login screen
+  //   • Anything else (404, 500, …)  → friendly error page with Try Again
+  const AUTH_ERROR_CODES = new Set([401, 403, 407, 440]);
   wc.on('did-navigate', (e, navUrl, httpResponseCode) => {
-    if (navUrl.startsWith('file://')) return;
-    if (navUrl.includes('/login')) return;   // never loop on the login page itself
-    if (httpResponseCode >= 400) {
-      console.warn(`HTTP ${httpResponseCode} on ${navUrl} — returning to login`);
+    if (navUrl.startsWith('file://') || httpResponseCode < 400) return;
+
+    if (AUTH_ERROR_CODES.has(httpResponseCode)) {
+      if (navUrl.includes('/login')) return; // never loop on the login page itself
+      console.warn(`HTTP ${httpResponseCode} on ${navUrl} — session expired, returning to login`);
+      sessionExpiredNotice = true;
       writePrefs({ ...readPrefs(), loggedIn: false, lastUrl: LOGIN_URL });
       pendingUrl = LOGIN_URL;
       mainWin.loadURL(LOADING_PAGE);
+    } else {
+      console.warn(`HTTP ${httpResponseCode} on ${navUrl} — showing error page`);
+      retryUrl = navUrl;
+      mainWin.loadURL(`${ERROR_PAGE}?code=${httpResponseCode}`);
     }
   });
 
@@ -408,6 +432,24 @@ function createWindow() {
   // ── Right-click context menu ───────────────────────────────────────────────
   wc.on('context-menu', (event, params) => {
     const template = [];
+
+    // Spelling suggestions first, like every browser
+    if (params.misspelledWord) {
+      const suggestions = (params.dictionarySuggestions || []).slice(0, 5);
+      for (const s of suggestions) {
+        template.push({ label: s, click: () => wc.replaceMisspelling(s) });
+      }
+      if (suggestions.length === 0) {
+        template.push({ label: 'No spelling suggestions', enabled: false });
+      }
+      template.push(
+        {
+          label: 'Add to Dictionary',
+          click: () => ses.addWordToSpellCheckerDictionary(params.misspelledWord),
+        },
+        { type: 'separator' },
+      );
+    }
 
     if (params.linkURL) {
       template.push(
@@ -581,14 +623,7 @@ function setupIpc(ses) {
   });
 
   // Print
-  ipcMain.on('print-page', () => {
-    mainWin?.webContents.print({
-      silent: false,
-      printBackground: true,
-    }, (success, reason) => {
-      if (!success) console.error('Print failed:', reason);
-    });
-  });
+  ipcMain.on('print-page', () => printPage());
 
   // Find in page (Ctrl+F overlay in preload)
   ipcMain.on('find-in-page', (e, text, opts) => {
@@ -606,6 +641,55 @@ function setupIpc(ses) {
       canGoForward: mainWin.webContents.canGoForward(),
     };
   });
+}
+
+// ── Printing ─────────────────────────────────────────────────────────────────
+// Silent printing only activates when the user has explicitly chosen a
+// receipt printer in the Printer menu AND turned the toggle on. Every
+// failure path falls back to the normal print dialog so nothing is lost.
+async function printPage() {
+  const wc = mainWin?.webContents;
+  if (!wc) return;
+
+  const prefs = readPrefs();
+  if (prefs.silentPrint && prefs.receiptPrinter) {
+    try {
+      // Verify the saved printer still exists before printing blind
+      const printers = await wc.getPrintersAsync();
+      const found = printers.find((p) => p.name === prefs.receiptPrinter);
+      if (found) {
+        wc.print({ silent: true, deviceName: found.name, printBackground: true }, (ok, reason) => {
+          if (!ok && reason !== 'cancelled') {
+            console.error('Silent print failed:', reason);
+            fallbackPrint(wc);
+          }
+        });
+        return;
+      }
+      dialog.showMessageBox(mainWin, {
+        type:    'warning',
+        title:   'Printer Not Found',
+        message: `Receipt printer "${prefs.receiptPrinter}" was not found.`,
+        detail:  'Using the normal print dialog instead. Re-select your printer in the Printer menu.',
+      });
+    } catch (err) {
+      console.error('Printer lookup failed:', err);
+    }
+  }
+  fallbackPrint(wc);
+}
+
+function fallbackPrint(wc) {
+  wc.print({ silent: false, printBackground: true }, (ok, reason) => {
+    if (!ok && reason !== 'cancelled') console.error('Print failed:', reason);
+  });
+}
+
+// Refresh the cached printer list, then rebuild the menu that displays it
+function refreshPrinters() {
+  mainWin?.webContents.getPrintersAsync()
+    .then((list) => { availablePrinters = list || []; buildAppMenu(); })
+    .catch(() => {});
 }
 
 // ── Download: will-download (handles normal file downloads) ──────────────────
@@ -831,6 +915,26 @@ function injectDownloadCompat(wc) {
   wc.executeJavaScript(js).catch(() => {});
 }
 
+// ── Toast notification injected into the page ────────────────────────────────
+function injectToast(wc, message) {
+  const js = `(function() {
+    var t = document.createElement('div');
+    t.textContent = ${JSON.stringify(message)};
+    t.style.cssText = 'position:fixed;top:18px;left:50%;transform:translateX(-50%);' +
+      'background:#111;color:#fff;padding:10px 22px;border-radius:8px;' +
+      "font:13px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;" +
+      'z-index:2147483647;opacity:0;transition:opacity .3s;' +
+      'box-shadow:0 4px 14px rgba(0,0,0,.25);pointer-events:none;';
+    document.body.appendChild(t);
+    requestAnimationFrame(function(){ t.style.opacity = '1'; });
+    setTimeout(function(){
+      t.style.opacity = '0';
+      setTimeout(function(){ t.remove(); }, 400);
+    }, 6000);
+  })();`;
+  wc.executeJavaScript(js).catch(() => {});
+}
+
 // ── Version tag on the login screen ──────────────────────────────────────────
 function injectVersionTag(wc) {
   const js = `(function() {
@@ -847,6 +951,43 @@ function injectVersionTag(wc) {
 }
 
 // ── App menu ─────────────────────────────────────────────────────────────────
+function buildPrinterMenu() {
+  const prefs = readPrefs();
+  const items = [];
+
+  items.push({
+    label:   'Silent Receipt Printing',
+    type:    'checkbox',
+    checked: !!(prefs.silentPrint && prefs.receiptPrinter),
+    enabled: !!prefs.receiptPrinter,
+    click:   (item) => {
+      writePrefs({ ...readPrefs(), silentPrint: item.checked });
+    },
+  });
+  items.push({ type: 'separator' });
+  items.push({ label: 'Receipt Printer:', enabled: false });
+
+  if (availablePrinters.length === 0) {
+    items.push({ label: 'No printers found', enabled: false });
+  } else {
+    for (const p of availablePrinters) {
+      items.push({
+        label:   (p.displayName || p.name) + (p.isDefault ? '   (Windows default)' : ''),
+        type:    'radio',
+        checked: prefs.receiptPrinter === p.name,
+        click:   () => {
+          writePrefs({ ...readPrefs(), receiptPrinter: p.name });
+          buildAppMenu();   // re-enable the silent toggle
+        },
+      });
+    }
+  }
+
+  items.push({ type: 'separator' });
+  items.push({ label: 'Refresh Printer List', click: refreshPrinters });
+  return items;
+}
+
 function buildAppMenu() {
   const template = [
     {
@@ -858,7 +999,7 @@ function buildAppMenu() {
         { label: 'Back',   accelerator: 'Alt+Left',      click: () => mainWin?.webContents.goBack() },
         { label: 'Forward',accelerator: 'Alt+Right',     click: () => mainWin?.webContents.goForward() },
         { type: 'separator' },
-        { label: 'Print',  accelerator: 'CmdOrCtrl+P',  click: () => mainWin?.webContents.print({ printBackground: true }) },
+        { label: 'Print',  accelerator: 'CmdOrCtrl+P',  click: () => printPage() },
         { type: 'separator' },
         {
           label: 'Data Saver (block images & media)',
@@ -893,6 +1034,10 @@ function buildAppMenu() {
           { role: 'toggleDevTools' },
         ] : []),
       ],
+    },
+    {
+      label: 'Printer',
+      submenu: buildPrinterMenu(),
     },
     {
       label: 'Update',
