@@ -62,6 +62,24 @@ Double-click it to install. It creates a Start Menu shortcut and a Desktop short
 
 ---
 
+## Shipping a new version (auto-update)
+
+The app auto-updates from **GitHub Releases** (`kadrikondi/inkeepx-desktopApp`).
+Users getting updates only happens once you **publish a release** — pushing code
+alone does nothing for installed apps. When you have a new version to ship:
+
+```powershell
+$env:GH_TOKEN = "ghp_your_token"     # token with repo scope, only on your machine
+npm version patch                     # 1.0.1 -> 1.0.2 (never reuse or lower a version)
+npm run release                       # builds + uploads installer to GitHub Releases
+```
+
+Installed apps check on every launch (and every 4 hours), download the update in
+the background, and ask the user to restart. The repo must be **public** for
+users to download updates. Full guide, caveats, and alternatives: [AUTO_UPDATE.md](AUTO_UPDATE.md).
+
+---
+
 ## Run without installing (development / quick test)
 
 ```bat
@@ -75,6 +93,7 @@ npm start
 
 | Action | Shortcut |
 |---|---|
+| Find on page | `Ctrl+F` |
 | Reload | `Ctrl+R` |
 | Back | `Alt+←` |
 | Forward | `Alt+→` |

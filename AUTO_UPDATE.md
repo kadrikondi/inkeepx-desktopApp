@@ -1,5 +1,27 @@
 # Auto-Update Setup Guide (electron-updater + GitHub Releases)
 
+> **Status: already implemented.** The updater code is live in `src/main.js`
+> (`setupAutoUpdate`), the publish config is in `package.json`, and
+> `electron-updater` is installed. Steps 2–4 below are kept as reference for
+> how it was done. What's left for you: make the repo public, then use the
+> quick reference below whenever you ship a new version.
+
+## Quick reference — shipping a new version
+
+Users getting updates only happens once you **publish a release**. Pushing
+code to GitHub does nothing for installed apps. Next time you have a new
+version to ship, the flow is:
+
+```powershell
+$env:GH_TOKEN = "ghp_your_token"     # token with repo scope, only on your machine
+npm version patch                     # 1.0.1 -> 1.0.2
+npm run release                       # builds + uploads installer to GitHub Releases
+```
+
+That's it — installed apps pick it up on their next launch or 4-hour check.
+
+---
+
 This guide adds automatic updates to InkeepX Desktop: the app checks GitHub
 Releases on startup, downloads new versions in the background, and installs
 them when the user quits.
