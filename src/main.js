@@ -333,6 +333,9 @@ function createWindow() {
     // Inject compatibility scripts
     injectDownloadCompat(wc);
     wc.executeJavaScript(`window.print = function(){ window.__electronPrint(); };`).catch(() => {});
+
+    // Version tag at the bottom of the login screen
+    if (onLogin) injectVersionTag(wc);
   });
 
   wc.on('did-fail-load', (e, code, desc, validatedUrl, isMainFrame) => {
@@ -448,14 +451,43 @@ function createWindow() {
 }
 
 // ── Auto-update ──────────────────────────────────────────────────────────────
-function setupAutoUpdate() {
-  // Only packaged builds can update; skip in development
-  if (!app.isPackaged) return;
+// Background checks stay silent unless an update is ready; a manual check
+// from the Update menu always answers with a dialog.
+let manualUpdateCheck = false;
 
+function setupAutoUpdate() {
   autoUpdater.autoDownload          = true;
   autoUpdater.autoInstallOnAppQuit  = true;   // installs silently on quit
 
+  autoUpdater.on('update-available', (info) => {
+    if (manualUpdateCheck) {
+      dialog.showMessageBox(mainWin, {
+        type:    'info',
+        title:   'Update Available',
+        message: `Version ${info.version} is available.`,
+        detail:  'Downloading in the background — you\'ll be asked to restart when it\'s ready.',
+      });
+    }
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    if (manualUpdateCheck) {
+      manualUpdateCheck = false;
+      dialog.showMessageBox(mainWin, {
+        type:    'info',
+        title:   'No Updates',
+        message: `You're on the latest version (v${app.getVersion()}).`,
+      });
+    }
+  });
+
+  autoUpdater.on('download-progress', (p) => {
+    mainWin?.setProgressBar(p.percent / 100);
+  });
+
   autoUpdater.on('update-downloaded', (info) => {
+    manualUpdateCheck = false;
+    mainWin?.setProgressBar(-1);
     dialog.showMessageBox(mainWin, {
       type:    'info',
       title:   'Update Ready',
@@ -472,13 +504,39 @@ function setupAutoUpdate() {
   });
 
   autoUpdater.on('error', (err) => {
-    // Never bother the user about update failures — just log
+    mainWin?.setProgressBar(-1);
     console.error('Auto-update error:', err?.message || err);
+    if (manualUpdateCheck) {
+      manualUpdateCheck = false;
+      dialog.showMessageBox(mainWin, {
+        type:    'warning',
+        title:   'Update Check Failed',
+        message: 'Could not check for updates.',
+        detail:  'Please check your internet connection and try again.',
+      });
+    }
   });
 
+  // Silent background checks — only in the installed (packaged) app
+  if (app.isPackaged) {
+    autoUpdater.checkForUpdates().catch(() => {});
+    // Re-check every 4 hours while the app stays open
+    setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 4 * 60 * 60 * 1000);
+  }
+}
+
+function checkForUpdatesManually() {
+  if (!app.isPackaged) {
+    dialog.showMessageBox(mainWin, {
+      type:    'info',
+      title:   'Development Mode',
+      message: 'Updates only work in the installed app.',
+      detail:  'Build and install the app to test auto-update.',
+    });
+    return;
+  }
+  manualUpdateCheck = true;
   autoUpdater.checkForUpdates().catch(() => {});
-  // Re-check every 4 hours while the app stays open
-  setInterval(() => autoUpdater.checkForUpdates().catch(() => {}), 4 * 60 * 60 * 1000);
 }
 
 // ── IPC ───────────────────────────────────────────────────────────────────────
@@ -759,6 +817,21 @@ function injectDownloadCompat(wc) {
   wc.executeJavaScript(js).catch(() => {});
 }
 
+// ── Version tag on the login screen ──────────────────────────────────────────
+function injectVersionTag(wc) {
+  const js = `(function() {
+    if (document.getElementById('__ixVersionTag')) return;
+    var d = document.createElement('div');
+    d.id = '__ixVersionTag';
+    d.textContent = 'InkeepX Online Desktop App \\u2022 v${app.getVersion()}';
+    d.style.cssText = 'position:fixed;bottom:14px;left:0;right:0;text-align:center;' +
+      "font:12px -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#999;" +
+      'z-index:2147483000;pointer-events:none;user-select:none;';
+    document.body.appendChild(d);
+  })();`;
+  wc.executeJavaScript(js).catch(() => {});
+}
+
 // ── App menu ─────────────────────────────────────────────────────────────────
 function buildAppMenu() {
   const template = [
@@ -805,6 +878,14 @@ function buildAppMenu() {
           { type: 'separator' },
           { role: 'toggleDevTools' },
         ] : []),
+      ],
+    },
+    {
+      label: 'Update',
+      submenu: [
+        { label: 'Check for Updates…', click: checkForUpdatesManually },
+        { type: 'separator' },
+        { label: `Current Version: v${app.getVersion()}`, enabled: false },
       ],
     },
   ];
