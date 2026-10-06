@@ -22,6 +22,22 @@ Windows desktop app for [inkeepx.com](https://www.inkeepx.com) — a full-featur
 
 ---
 
+## Troubleshooting
+
+- **The app looks different from the website (missing buttons, old layout):**
+  use **InkeepX → Clear Cache & Reload** (`Ctrl+Shift+R` or `Ctrl+F5`). The app
+  also clears its caches automatically the first time a new version runs.
+  Only assets with a content hash or `?v=` stamp in their URL are cached long-term.
+- **Clicking a field does nothing after a reload:** fixed in 1.0.5 — the app now
+  hands keyboard focus back to the page after every navigation and unsticks the
+  window when a click on a field does not activate it.
+- **Share buttons on invoices:** the website checks for the Web Share API, which
+  Windows/Electron lacks. The app provides it and opens a chooser with
+  WhatsApp, Email, Copy Text and Save File. Files cannot be attached to
+  WhatsApp/Email automatically; they are revealed in Explorer for drag-and-drop.
+
+---
+
 ## Build via GitHub Actions (recommended — no local setup needed)
 
 1. Push this folder to a **new GitHub repository** (public or private).

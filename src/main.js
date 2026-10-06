@@ -10,6 +10,10 @@
  *   • External links open in the system browser
  *   • Navigation toolbar (back / forward / reload / home)
  *   • Right-click context menu (reload, back, forward, open DevTools in dev)
+ *   • navigator.share() → WhatsApp / Email / Copy / Save chooser (no share sheet on Windows)
+ *   • Focus recovery after navigations (inputs that stop reacting to clicks)
+ *   • Cache safety: only content-hashed assets are cached long-term; caches are
+ *     purged on the first run of a new version; Ctrl+Shift+R clears them by hand
  */
 
 'use strict';
@@ -51,6 +55,7 @@ const SESS_PART    = 'inkeepx-persist';         // named session keeps cookies
 const LOADING_PAGE = url.pathToFileURL(path.join(__dirname, 'loading.html')).toString();
 const OFFLINE_PAGE = url.pathToFileURL(path.join(__dirname, 'offline.html')).toString();
 const ERROR_PAGE   = url.pathToFileURL(path.join(__dirname, 'error.html')).toString();
+const SHARE_DIR    = path.join(app.getPath('temp'), 'InkeepX Share');   // files handed to navigator.share()
 
 // ── State ────────────────────────────────────────────────────────────────────
 let isOffline   = false;   // true while the offline page is shown
@@ -61,6 +66,8 @@ let isQuitting  = false;   // don't auto-recover a renderer that died because we
 let retryUrl    = null;    // exact URL to retry (set when the error page is shown)
 let sessionExpiredNotice = false;  // show a toast on the login page after an auth error
 let availablePrinters    = [];     // cached printer list for the Printer menu
+let startupReady = Promise.resolve(); // resolves once stale caches from an older build are purged
+let unresponsiveDialogOpen = false;   // never stack "page not responding" dialogs
 
 // ── Tiny JSON store (avoids adding electron-store runtime dep for packaging) ─
 function readPrefs() {
@@ -68,7 +75,29 @@ function readPrefs() {
   catch { return {}; }
 }
 function writePrefs(data) {
-  fs.writeFileSync(PREFS_FILE, JSON.stringify(data, null, 2));
+  try { fs.writeFileSync(PREFS_FILE, JSON.stringify(data, null, 2)); }
+  catch (err) { console.error('Could not save preferences:', err.message); }
+}
+
+// ── Focus recovery ───────────────────────────────────────────────────────────
+// Chromium on Windows sometimes leaves the page's input fields unfocusable after a
+// navigation (form re-submitted with validation errors, reload, a beforeunload
+// prompt…). The window is focused but the web contents is not, so clicks land
+// but nothing activates until the user switches pages or restarts the app.
+// Handing focus back to the web contents after every load — and un-focusing /
+// re-focusing the window when the page reports it is stuck — clears that state.
+function ensureWebFocus() {
+  if (!mainWin || mainWin.isDestroyed() || !mainWin.isFocused()) return;
+  try { mainWin.webContents.focus(); } catch { /* window closing */ }
+}
+
+function kickWebFocus() {
+  if (!mainWin || mainWin.isDestroyed() || !mainWin.isFocused()) return;
+  try {
+    mainWin.blur();
+    mainWin.focus();
+    mainWin.webContents.focus();
+  } catch { /* window closing */ }
 }
 
 // ── Global refs ──────────────────────────────────────────────────────────────
@@ -114,7 +143,48 @@ function saveWindowState() {
 
 // ── Slow-network helpers ─────────────────────────────────────────────────────
 const STATIC_ASSET_RE = /\.(m?js|css|woff2?|ttf|otf|png|jpe?g|gif|webp|avif|svg|ico)([?#].*)?$/i;
+// Only assets whose URL changes when their content changes may be cached for a
+// long time: Vite's /build/ output, hashed filenames (app-3f9a1c2b.css), or
+// version-stamped URLs (style.css?v=12). Plain /css/app.css must keep the
+// server's own headers — otherwise a deploy on inkeepx.com (new sales layout,
+// the invoice Share buttons…) is invisible in the desktop app for a week while
+// the website's service worker happily re-caches the stale copy we hand it.
+const FINGERPRINTED_RE = /(\/build\/|[-._][0-9a-f]{8,}\.[a-z0-9]+([?#]|$)|[?&](v|ver|version|rev|hash|t)=)/i;
+// The service worker script itself is how the site invalidates its caches —
+// never make it look fresher than the server says.
+const SW_SCRIPT_RE = /\/(service-?worker|sw)[^/]*\.js([?#].*)?$/i;
 const TRACKER_RE = /(google-analytics\.com|googletagmanager\.com|doubleclick\.net|connect\.facebook\.net|hotjar\.com|segment\.(io|com)|mixpanel\.com|clarity\.ms)/i;
+
+// Earlier builds forced every CSS/JS file to be cached for 7 days, so users who
+// upgrade carry stale assets in both the HTTP cache and the site's service-worker
+// cache. Wipe both once per app version — cookies and localStorage are untouched,
+// so the user stays signed in.
+async function purgeStaleCachesIfUpdated(ses) {
+  const version = app.getVersion();
+  if (readPrefs().lastVersion === version) return;
+  try {
+    await ses.clearCache();
+    await ses.clearStorageData({ storages: ['cachestorage', 'serviceworkers'] });
+    console.log(`Caches purged for first run of v${version}`);
+  } catch (err) {
+    console.warn('Cache purge failed:', err.message);
+  }
+  writePrefs({ ...readPrefs(), lastVersion: version });
+}
+
+// Menu action / Ctrl+Shift+R: drop every cached copy of the site and reload.
+async function clearCacheAndReload() {
+  if (!mainWin || mainWin.isDestroyed() || !mainSes) return;
+  try {
+    await mainSes.clearCache();
+    await mainSes.clearStorageData({ storages: ['cachestorage', 'serviceworkers'] });
+  } catch (err) {
+    console.warn('Clear cache failed:', err.message);
+  }
+  const wc = mainWin.webContents;
+  if (wc.getURL().startsWith('file://')) retryLoad();
+  else wc.reloadIgnoringCache();
+}
 
 // Perform DNS + TCP + TLS handshakes while the splash screen is showing so the
 // real navigation reuses the warm connection (saves 1–3 s on high-latency links).
@@ -133,7 +203,8 @@ function setupNetworkOptimizations(ses) {
   // sends short-lived cache headers — repeat launches barely touch the network.
   ses.webRequest.onHeadersReceived((details, callback) => {
     if (details.method !== 'GET' || details.statusCode !== 200 ||
-        !STATIC_ASSET_RE.test(details.url)) {
+        !STATIC_ASSET_RE.test(details.url) || SW_SCRIPT_RE.test(details.url) ||
+        !FINGERPRINTED_RE.test(details.url)) {
       callback({});
       return;
     }
@@ -142,7 +213,7 @@ function setupNetworkOptimizations(ses) {
       const lk = k.toLowerCase();
       if (lk !== 'cache-control' && lk !== 'pragma' && lk !== 'expires') headers[k] = v;
     }
-    headers['Cache-Control'] = ['public, max-age=604800, stale-while-revalidate=86400'];
+    headers['Cache-Control'] = ['public, max-age=2592000, immutable'];
     callback({ responseHeaders: headers });
   });
 
@@ -192,7 +263,7 @@ function stopReconnectProbe() {
 
 // Shared by the offline/error pages' Retry buttons and the auto-reconnect probe.
 function retryLoad() {
-  if (!mainWin) return;
+  if (!mainWin || mainWin.isDestroyed()) return;
   isOffline = false;
   stopReconnectProbe();
   warmUpConnection();
@@ -231,6 +302,16 @@ function createWindow() {
   // Warm the connection immediately — handshakes happen behind the splash.
   warmUpConnection();
   setupNetworkOptimizations(ses);
+  startupReady = purgeStaleCachesIfUpdated(ses);
+
+  // Present as a regular Chrome browser. Some sites (Google sign-in, WAFs,
+  // browser-detection libraries) refuse or mis-detect the "Electron/x" token.
+  // The app keeps its own token so the website can still recognise it.
+  const userAgent = ses.getUserAgent()
+    .replace(/\sElectron\/\S+/, '')
+    .replace(/\sinkeepx-desktop\/\S+/i, ` InkeepXDesktop/${app.getVersion()}`);
+  ses.setUserAgent(userAgent);
+  app.userAgentFallback = userAgent;
 
   // Spellcheck in text fields (suggestions appear in the right-click menu)
   try { ses.setSpellCheckerLanguages(['en-US']); } catch { /* unsupported language */ }
@@ -247,6 +328,10 @@ function createWindow() {
   ses.setPermissionRequestHandler((webContents, permission, callback, details) => {
     const requestingUrl = (details && details.requestingUrl) || webContents.getURL();
     callback(isInkeepxUrl(requestingUrl) && ALLOWED_PERMISSIONS.has(permission));
+  });
+  // Synchronous checks (e.g. Notification.permission) must agree with the above.
+  ses.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
+    return isInkeepxUrl(requestingOrigin) && ALLOWED_PERMISSIONS.has(permission);
   });
 
   const winState = getSavedWindowState();
@@ -281,6 +366,10 @@ function createWindow() {
 
   // Remember size/position for next launch
   mainWin.on('close', saveWindowState);
+
+  // When the user comes back to the window (Alt+Tab, taskbar), make sure the
+  // page — not the window chrome — gets keyboard focus.
+  mainWin.on('focus', ensureWebFocus);
 
   // ── Application menu (minimal — just what's useful) ───────────────────────
   buildAppMenu();
@@ -321,7 +410,8 @@ function createWindow() {
       if (pendingUrl) {
         const target = pendingUrl;
         pendingUrl = null;
-        wc.loadURL(target);
+        // Wait for the one-time cache purge so the first page after an update is fresh
+        startupReady.then(() => { if (!wc.isDestroyed()) wc.loadURL(target); });
       }
       return;
     }
@@ -340,9 +430,8 @@ function createWindow() {
       lastUrl:  onLogin ? LOGIN_URL : currentUrl,
     });
 
-    // Inject compatibility scripts
-    injectDownloadCompat(wc);
-    wc.executeJavaScript(`window.print = function(){ window.__electronPrint(); };`).catch(() => {});
+    // Give keyboard focus back to the page (see ensureWebFocus)
+    ensureWebFocus();
 
     // Version tag at the bottom of the login screen
     if (onLogin) injectVersionTag(wc);
@@ -369,23 +458,63 @@ function createWindow() {
     startReconnectProbe();
   });
 
-  // Open external links in the system browser
-  wc.setWindowOpenHandler(({ url: openUrl }) => {
-    if (!isInkeepxUrl(openUrl)) {
-      shell.openExternal(openUrl);
-      return { action: 'deny' };
+  // Open external links in the system browser; keep inkeepx.com pop-ups
+  // (invoice previews, PDFs opened with target=_blank) inside the app.
+  const childWindowOptions = {
+    autoHideMenuBar: true,
+    icon: path.join(__dirname, '..', 'assets', 'icon.png'),
+    backgroundColor: '#ffffff',
+    webPreferences: {
+      session: ses,
+      partition: `persist:${SESS_PART}`,
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: true,
+      plugins: true,
+      spellcheck: true,
+    },
+  };
+  const windowOpenHandler = ({ url: openUrl }) => {
+    if (!openUrl || openUrl === 'about:blank' || isInkeepxUrl(openUrl)) {
+      return { action: 'allow', overrideBrowserWindowOptions: childWindowOptions };
     }
-    return { action: 'allow' };
-  });
-
-  wc.on('will-navigate', (event, navUrl) => {
+    shell.openExternal(openUrl).catch(() => {});
+    return { action: 'deny' };
+  };
+  const guardNavigation = (event, navUrl) => {
     // Allow local pages (loading / offline)
     if (navUrl.startsWith('file://') || navUrl.startsWith('about:')) return;
-    // Keep navigation inside inkeepx.com; send everything else to the browser
+    // Keep navigation inside inkeepx.com; send everything else (https links,
+    // mailto:, whatsapp:, tel:) to the system handler
     if (!isInkeepxUrl(navUrl)) {
       event.preventDefault();
-      shell.openExternal(navUrl);
+      shell.openExternal(navUrl).catch(() => {});
     }
+  };
+  wc.setWindowOpenHandler(windowOpenHandler);
+  wc.on('will-navigate', guardNavigation);
+  wc.on('did-create-window', (child) => {
+    child.webContents.setWindowOpenHandler(windowOpenHandler);
+    child.webContents.on('will-navigate', guardNavigation);
+  });
+
+  // The site may ask "leave page? unsaved changes" via beforeunload. Electron
+  // shows nothing by default — the reload just silently does nothing, which
+  // looks like a frozen app. Ask the user, then re-focus the page because the
+  // dialog itself can leave inputs unfocusable (electron/electron#35129).
+  wc.on('will-prevent-unload', (event) => {
+    const choice = dialog.showMessageBoxSync(mainWin, {
+      type:      'question',
+      title:     'Leave this page?',
+      message:   'Changes you made may not be saved.',
+      buttons:   ['Leave', 'Stay'],
+      defaultId: 0,
+      cancelId:  1,
+      noLink:    true,
+    });
+    if (choice === 0) event.preventDefault();   // proceed with the navigation
+    setTimeout(kickWebFocus, 50);
   });
 
   // ── Session expiry / HTTP errors ───────────────────────────────────────────
@@ -394,6 +523,7 @@ function createWindow() {
   //   • Anything else (404, 500, …)  → friendly error page with Try Again
   const AUTH_ERROR_CODES = new Set([401, 403, 407, 440]);
   wc.on('did-navigate', (e, navUrl, httpResponseCode) => {
+    ensureWebFocus();
     if (navUrl.startsWith('file://') || httpResponseCode < 400) return;
 
     if (AUTH_ERROR_CODES.has(httpResponseCode)) {
@@ -417,8 +547,40 @@ function createWindow() {
     retryLoad();
   });
 
-  wc.on('unresponsive', () => {
+  wc.on('unresponsive', async () => {
     console.warn('Page unresponsive');
+    if (unresponsiveDialogOpen || isQuitting) return;
+    unresponsiveDialogOpen = true;
+    try {
+      const { response } = await dialog.showMessageBox(mainWin, {
+        type:      'warning',
+        title:     'Page Not Responding',
+        message:   'InkeepX is taking too long to respond.',
+        detail:    'You can wait a little longer or reload the page.',
+        buttons:   ['Wait', 'Reload'],
+        defaultId: 0,
+        cancelId:  0,
+        noLink:    true,
+      });
+      // A hung renderer can't navigate; killing it triggers the crash-recovery reload.
+      if (response === 1 && !wc.isDestroyed()) wc.forcefullyCrashRenderer();
+    } finally {
+      unresponsiveDialogOpen = false;
+    }
+  });
+
+  // Windows keyboard conventions the menu accelerators don't cover
+  wc.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return;
+    if (input.key === 'F5' && !input.control && !input.shift) {
+      event.preventDefault();
+      if (wc.getURL().startsWith('file://')) retryLoad(); else wc.reload();
+    } else if (input.key === 'F5' && (input.control || input.shift)) {
+      event.preventDefault();
+      clearCacheAndReload();          // Ctrl+Shift+R is handled by the menu accelerator
+    } else if (input.key === 'Escape' && mainWin.isFullScreen()) {
+      mainWin.setFullScreen(false);
+    }
   });
 
   // Forward find-in-page results to the find bar in the renderer
@@ -455,6 +617,14 @@ function createWindow() {
       template.push(
         { label: 'Open Link in Browser', click: () => shell.openExternal(params.linkURL) },
         { label: 'Copy Link Address',    click: () => clipboard.writeText(params.linkURL) },
+        { type: 'separator' },
+      );
+    }
+
+    if (params.mediaType === 'image' && params.srcURL) {
+      template.push(
+        { label: 'Copy Image',       click: () => wc.copyImageAt(params.x, params.y) },
+        { label: 'Save Image As…',   click: () => wc.downloadURL(params.srcURL) },
         { type: 'separator' },
       );
     }
@@ -605,6 +775,13 @@ function setupIpc(ses) {
 
   // Retry when offline — load the splash then the real URL
   ipcMain.on('retry', retryLoad);
+
+  // The page noticed a click on a field that didn't take focus — unstick it
+  ipcMain.on('focus-fix', kickWebFocus);
+
+  // navigator.share() polyfill (preload) — Windows has no native share sheet,
+  // so offer WhatsApp / Email / Copy / Save instead
+  ipcMain.handle('share', (event, data) => handleShare(data));
 
   // File upload — preload asks us for a file path
   ipcMain.handle('open-file-dialog', async (event, opts = {}) => {
@@ -781,8 +958,12 @@ async function saveBase64File(base64, mimeType, suggestedName) {
 
   if (canceled || !savePath) return;  // user cancelled
 
-  const data = Buffer.from(base64, 'base64');
-  fs.writeFileSync(savePath, data);
+  try {
+    fs.writeFileSync(savePath, Buffer.from(base64, 'base64'));
+  } catch (err) {
+    dialog.showErrorBox('Save Failed', `Could not write ${path.basename(savePath)}.\n${err.message}`);
+    return;
+  }
 
   const { response } = await dialog.showMessageBox(mainWin, {
     type:    'info',
@@ -795,124 +976,94 @@ async function saveBase64File(base64, mimeType, suggestedName) {
   if (response === 1) shell.openPath(savePath);
 }
 
-// ── Inject download compat script (mirrors Android injectDownloadCompatScript) 
-function injectDownloadCompat(wc) {
-  // This JS intercepts blob: and data: URLs created on the page and
-  // routes them through the IPC bridge so the main process can save them.
-  const js = `
-(function() {
-  if (window.__inkeepxElectronPatched) return;
-  window.__inkeepxElectronPatched = true;
+// ── Share (navigator.share polyfill target) ─────────────────────────────────
+// The website shows its invoice "Share" options when the Web Share API exists.
+// Chrome on Windows has it; Electron does not. preload.js installs
+// navigator.share / canShare on every page and forwards the request here.
+function safeFileName(name, fallback) {
+  const cleaned = String(name || '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').trim();
+  return cleaned || fallback;
+}
 
-  // ── Print bridge ──────────────────────────────────────────────────────────
-  window.__electronPrint = function() {
-    if (window.__electronBridge) window.__electronBridge.printPage();
-  };
+async function handleShare(data) {
+  if (!mainWin || mainWin.isDestroyed()) return { ok: false, error: 'AbortError' };
+  const d       = data && typeof data === 'object' ? data : {};
+  const title   = String(d.title || '').trim();
+  const text    = String(d.text  || '').trim();
+  const link    = String(d.url   || '').trim();
+  const files   = Array.isArray(d.files) ? d.files.filter((f) => f && typeof f.b64 === 'string') : [];
+  const message = [title, text, link].filter(Boolean).join('\n');
 
-  // ── Blob / data: URL map (same logic as Android) ──────────────────────────
-  window.__inkeepxBlobMap = window.__inkeepxBlobMap || {};
-  var map = window.__inkeepxBlobMap;
-  var origCreate = URL.createObjectURL.bind(URL);
-  var origRevoke = URL.revokeObjectURL.bind(URL);
-
-  URL.createObjectURL = function(blob) {
-    var u = origCreate(blob);
-    try {
-      map[u] = { blob: blob, b64: '', mime: (blob && blob.type) ? blob.type : 'application/octet-stream' };
-      var fr = new FileReader();
-      fr.onloadend = function() {
-        var d = String(fr.result || '');
-        var i = d.indexOf(',');
-        if (map[u]) map[u].b64 = i >= 0 ? d.substring(i + 1) : '';
-      };
-      fr.readAsDataURL(blob);
-    } catch(e) {}
-    return u;
-  };
-
-  URL.revokeObjectURL = function(u) {
-    try { delete map[u]; } catch(e) {}
-    return origRevoke(u);
-  };
-
-  function toAbsUrl(href) {
-    try { return new URL(href, location.href).toString(); } catch(e) { return href; }
+  // Files first: write them to a temp folder so they can be attached by hand.
+  const savedPaths = [];
+  if (files.length) {
+    try { fs.mkdirSync(SHARE_DIR, { recursive: true }); } catch { /* exists */ }
+    files.forEach((f, i) => {
+      const name = safeFileName(f.name, `share-${Date.now()}-${i + 1}`);
+      const dest = path.join(SHARE_DIR, name);
+      try { fs.writeFileSync(dest, Buffer.from(f.b64, 'base64')); savedPaths.push(dest); }
+      catch (err) { console.error('Could not stage shared file:', err.message); }
+    });
   }
 
-  function sendBlob(blob, filename) {
-    var fr = new FileReader();
-    fr.onloadend = function() {
-      var d = String(fr.result || '');
-      var i = d.indexOf(',');
-      var b64 = i >= 0 ? d.substring(i + 1) : '';
-      if (window.__electronBridge) {
-        window.__electronBridge.downloadBase64(b64, blob.type || 'application/octet-stream', filename || '');
+  const buttons = ['WhatsApp', 'Email'];
+  if (savedPaths.length) buttons.push('Save File…');
+  if (message)           buttons.push('Copy Text');
+  buttons.push('Cancel');
+
+  let detail = message;
+  if (savedPaths.length) {
+    const names = savedPaths.map((p) => path.basename(p)).join(', ');
+    detail = `Attachment: ${names}\n\nWindows can't attach files to WhatsApp or Email automatically — ` +
+             `the file will open in Explorer so you can drag it into the chat or message.` +
+             (message ? `\n\n${message}` : '');
+  }
+
+  const { response } = await dialog.showMessageBox(mainWin, {
+    type:      'none',
+    title:     'Share',
+    message:   title || 'Share via',
+    detail,
+    buttons,
+    defaultId: 0,
+    cancelId:  buttons.length - 1,
+    noLink:    true,
+  });
+  const choice = buttons[response];
+  setTimeout(kickWebFocus, 50);   // dialogs can leave the page unfocused
+
+  const revealFiles = () => { for (const p of savedPaths) shell.showItemInFolder(p); };
+
+  try {
+    if (choice === 'WhatsApp') {
+      await shell.openExternal(`https://wa.me/?text=${encodeURIComponent(message)}`);
+      revealFiles();
+    } else if (choice === 'Email') {
+      const subject = encodeURIComponent(title || 'InkeepX');
+      const body    = encodeURIComponent(message);
+      await shell.openExternal(`mailto:?subject=${subject}&body=${body}`);
+      revealFiles();
+    } else if (choice === 'Copy Text') {
+      clipboard.writeText(message);
+    } else if (choice === 'Save File…') {
+      for (const p of savedPaths) {
+        const { canceled, filePath } = await dialog.showSaveDialog(mainWin, {
+          title:       'Save File',
+          defaultPath: path.join(app.getPath('downloads'), path.basename(p)),
+          buttonLabel: 'Save',
+        });
+        if (canceled || !filePath) continue;
+        fs.copyFileSync(p, filePath);
+        shell.showItemInFolder(filePath);
       }
-    };
-    fr.readAsDataURL(blob);
+    } else {
+      return { ok: false, error: 'AbortError', message: 'Share canceled' };
+    }
+  } catch (err) {
+    console.error('Share failed:', err.message);
+    return { ok: false, error: 'DataError', message: err.message };
   }
-
-  function handleHref(href, filename) {
-    if (!href) return false;
-    var u = toAbsUrl(href);
-
-    if (u.indexOf('blob:') === 0 && map[u]) {
-      if (map[u].b64) {
-        if (window.__electronBridge)
-          window.__electronBridge.downloadBase64(map[u].b64, map[u].mime || 'application/octet-stream', filename || '');
-      } else if (map[u].blob) {
-        sendBlob(map[u].blob, filename);
-      } else { return false; }
-      return true;
-    }
-    if (u.indexOf('data:') === 0) {
-      var parts = u.split(',');
-      var meta  = parts[0] || '';
-      var b64   = parts[1] || '';
-      var mime  = (meta.split(';')[0] || '').replace('data:', '') || 'application/octet-stream';
-      if (window.__electronBridge)
-        window.__electronBridge.downloadBase64(b64, mime, filename || '');
-      return true;
-    }
-    if (u.indexOf('.csv') >= 0 || u.indexOf('format=csv') >= 0) {
-      fetch(u, { credentials: 'include' })
-        .then(function(r) { return r.blob(); })
-        .then(function(b) { sendBlob(b, filename); })
-        .catch(function() {});
-      return true;
-    }
-    return false;
-  }
-
-  document.addEventListener('click', function(ev) {
-    var a = ev.target && ev.target.closest
-      ? ev.target.closest('a[download], a[href*=".csv"], a[href*="format=csv"]')
-      : null;
-    if (!a) return;
-    var href     = a.getAttribute('href') || '';
-    var filename = a.getAttribute('download') || '';
-    if (handleHref(href, filename)) {
-      ev.preventDefault();
-      ev.stopPropagation();
-    }
-  }, true);
-
-  var origAnchorClick = HTMLAnchorElement.prototype.click;
-  HTMLAnchorElement.prototype.click = function() {
-    try {
-      var href     = this.getAttribute('href') || this.href || '';
-      var filename = this.getAttribute('download') || '';
-      var isDownload = this.hasAttribute('download');
-      if (isDownload || href.indexOf('blob:') === 0 || href.indexOf('data:') === 0 ||
-          href.indexOf('.csv') >= 0 || href.indexOf('format=csv') >= 0) {
-        if (handleHref(href, filename)) return;
-      }
-    } catch(e) {}
-    return origAnchorClick.apply(this, arguments);
-  };
-})();
-  `;
-  wc.executeJavaScript(js).catch(() => {});
+  return { ok: true };
 }
 
 // ── Toast notification injected into the page ────────────────────────────────
@@ -996,6 +1147,7 @@ function buildAppMenu() {
         { label: 'Home',   click: () => mainWin?.loadURL(LOGIN_URL) },
         { type:  'separator' },
         { label: 'Reload', accelerator: 'CmdOrCtrl+R',  click: () => mainWin?.webContents.reload() },
+        { label: 'Clear Cache & Reload', accelerator: 'CmdOrCtrl+Shift+R', click: clearCacheAndReload },
         { label: 'Back',   accelerator: 'Alt+Left',      click: () => mainWin?.webContents.goBack() },
         { label: 'Forward',accelerator: 'Alt+Right',     click: () => mainWin?.webContents.goForward() },
         { type: 'separator' },
