@@ -1,6 +1,6 @@
 {
   "name": "inkeepx-desktop",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "InkeepX Desktop — WebView wrapper for inkeepx.com",
   "main": "src/main.js",
   "author": "InkeepX",
